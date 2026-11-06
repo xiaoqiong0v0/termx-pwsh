@@ -2490,7 +2490,7 @@ namespace Microsoft.PowerShell
         /// Neither this class' instances nor its static data is threadsafe.  Caller is responsible for ensuring threadsafe
         /// access.
         /// </summary>
-        private sealed class InputLoop
+        private sealed partial class InputLoop
         {
             internal static void RunNewInputLoop(ConsoleHost parent, bool isNested)
             {
@@ -2620,6 +2620,8 @@ namespace Microsoft.PowerShell
 
                         if (!ui.NoPrompt)
                         {
+                            WriteShellEvent("A");
+
                             if (inBlockMode)
                             {
                                 // use a special prompt that denotes block mode
@@ -2648,6 +2650,7 @@ namespace Microsoft.PowerShell
                             }
 
                             ui.Write(prompt);
+                            WriteShellEvent("B");
                         }
 
 #if UNIX
@@ -2769,6 +2772,11 @@ namespace Microsoft.PowerShell
                             }
 #endif
 
+                            // Incomplete input never executes: the continuation
+                            // accumulates more lines first, so the start event is
+                            // withheld and the pending record is cancelled instead.
+                            bool commandStarted = BeforeCommand(line);
+
                             if (_parent.IsRunningAsync && !_parent.IsNested)
                             {
                                 _exec.ExecuteCommandAsync(line, out e, Executor.ExecutionOptions.AddOutputter | Executor.ExecutionOptions.AddToHistory);
@@ -2806,6 +2814,8 @@ namespace Microsoft.PowerShell
                                     _parent.PopRunspace();
                                 }
                             }
+
+                            AfterCommand(commandStarted, e);
 
 #if LEGACYTELEMETRY
                             if (!inBlockMode)
