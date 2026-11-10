@@ -81,6 +81,19 @@ namespace Microsoft.PowerShell
                     return;
                 }
 
+                // The host's output writer can still hold buffered output when
+                // execution returns. Flush content already produced so D is
+                // queued after the command's visible output, not before it.
+                try
+                {
+                    Console.Out.Flush();
+                    Console.Error.Flush();
+                }
+                catch
+                {
+                    // Redirected/closed console streams: events still work.
+                }
+
                 WriteShellEvent(
                     "D",
                     GetCommandExitCode(e),
