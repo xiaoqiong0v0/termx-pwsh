@@ -39,6 +39,20 @@ namespace Microsoft.PowerShell
         }
 
         /// <summary>
+        /// Publish a chunk of command output out of band. Only the active
+        /// command id receives output; prompts and input echo have no id.
+        /// </summary>
+        internal static void WriteShellOutput(string text, bool newLine)
+        {
+            if (string.IsNullOrEmpty(text))
+            {
+                return;
+            }
+
+            s_shellEvents.WriteOutput(newLine ? text + Environment.NewLine : text);
+        }
+
+        /// <summary>
         /// Command-boundary bookkeeping for the out-of-band event channel.
         /// Lives here (not in ConsoleHost.cs) so upstream merges only see two
         /// short call sites inside the input loop.
@@ -93,6 +107,11 @@ namespace Microsoft.PowerShell
                 {
                     // Redirected/closed console streams: events still work.
                 }
+
+                // Ensure every O frame produced by this command is on the
+                // event pipe before D; this is event-queue drain, not a
+                // timing-based boundary.
+                s_shellEvents.WaitForOutputDrain(2000);
 
                 WriteShellEvent(
                     "D",
@@ -184,7 +203,8 @@ namespace Microsoft.PowerShell
         private const string TokenVariable = "TERMX_EVENT_TOKEN";
         private const string PipePrefix = "pipe:";
         private const string UnixPrefix = "unix:";
-        private const int MaxQueuedEvents = 64;
+        private const int MaxQueuedEvents = 1024;
+        private const int MaxOutputChunkChars = 512;
         private const int ConnectTimeoutMilliseconds = 3000;
 
         private readonly BlockingCollection<string> _queue =
@@ -192,6 +212,9 @@ namespace Microsoft.PowerShell
 
         private readonly string _endpoint;
         private readonly string _token;
+        private readonly object _commandLock = new object();
+        private readonly object _outputDrainLock = new object();
+        private int _pendingOutput;
         private volatile bool _enabled;
         private string _currentCommandId;
 
@@ -242,29 +265,145 @@ namespace Microsoft.PowerShell
             switch (kind)
             {
                 case "C":
-                    _currentCommandId = Guid.NewGuid().ToString("N");
-                    line = BuildLine(kind, code, _currentCommandId, command, startedAtMs, null);
-                    break;
+                {
+                    string commandId = Guid.NewGuid().ToString("N");
+                    // Build, publish the active id and enqueue under the same
+                    // lock as O/D: an O from another thread must never be
+                    // queued before this command's C.
+                    lock (_commandLock)
+                    {
+                        _currentCommandId = commandId;
+                        TryEnqueue(BuildLine(kind, code, commandId, command, startedAtMs, null));
+                    }
+                    return;
+                }
                 case "D":
                 {
-                    string commandId = _currentCommandId;
-                    _currentCommandId = null;
-                    line = BuildLine(kind, code, commandId, null, null, endedAtMs);
-                    break;
+                    lock (_commandLock)
+                    {
+                        string commandId = _currentCommandId;
+                        _currentCommandId = null;
+                        TryEnqueue(BuildLine(kind, code, commandId, null, null, endedAtMs));
+                    }
+                    return;
                 }
                 default:
                     line = BuildLine(kind, code, null, null, null, null);
                     break;
             }
 
+            TryEnqueue(line);
+        }
+
+        /// <summary>
+        /// Non-blocking enqueue shared by C/D/O and other events. A full queue
+        /// drops the frame instead of blocking the prompt; a closed channel is
+        /// also treated as a drop. C/D call it while holding
+        /// <see cref="_commandLock"/> so their order with O is fixed.
+        /// </summary>
+        /// <param name="line">Encoded JSON Lines frame.</param>
+        /// <returns>True when the frame was queued.</returns>
+        private bool TryEnqueue(string line)
+        {
             try
             {
-                // Queue full: drop the event rather than blocking the prompt.
-                _queue.TryAdd(line);
+                return _queue.TryAdd(line);
             }
             catch (InvalidOperationException)
             {
                 // Channel already closed; keep the prompt usable.
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Publish command output as out-of-band `O` chunks. No output is
+        /// published without an active command id, so prompt/input echo is
+        /// excluded by construction.
+        /// </summary>
+        internal void WriteOutput(string text)
+        {
+            if (!_enabled || string.IsNullOrEmpty(text))
+            {
+                return;
+            }
+
+            // Hold the same command lock while checking id and enqueueing all
+            // chunks. C publishes the id and enqueues under this lock; D
+            // clears the id and enqueues under this lock, so O can never be
+            // queued before C or after D. A full queue (capacity
+            // MaxQueuedEvents) drops the chunk instead of blocking the prompt.
+            lock (_commandLock)
+            {
+                string commandId = _currentCommandId;
+                if (string.IsNullOrEmpty(commandId))
+                {
+                    return;
+                }
+
+                int offset = 0;
+                while (offset < text.Length)
+                {
+                    int length = Math.Min(MaxOutputChunkChars, text.Length - offset);
+                    // Do not split a UTF-16 surrogate pair across chunks.
+                    if (length > 0
+                        && offset + length < text.Length
+                        && char.IsHighSurrogate(text[offset + length - 1]))
+                    {
+                        length--;
+                    }
+                    if (length <= 0)
+                    {
+                        break;
+                    }
+
+                    string chunk = text.Substring(offset, length);
+                    string encoded = Convert.ToBase64String(Encoding.UTF8.GetBytes(chunk));
+                    string line = "{\"v\":1,\"event\":\"O\",\"id\":"
+                        + JsonSerializer.Serialize(commandId)
+                        + ",\"data\":\""
+                        + encoded
+                        + "\"}";
+                    lock (_outputDrainLock)
+                    {
+                        _pendingOutput++;
+                    }
+                    if (!TryEnqueue(line))
+                    {
+                        // Queue full/closed: drop this and the remaining
+                        // chunks, roll the drain counter back and let D pass.
+                        lock (_outputDrainLock)
+                        {
+                            _pendingOutput--;
+                            Monitor.PulseAll(_outputDrainLock);
+                        }
+                        return;
+                    }
+                    offset += length;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Wait until all queued O frames have been written to the event pipe.
+        /// D is queued only after this returns, so service observes O before D.
+        /// Timeout is a failure guard, not a normal delay.
+        /// </summary>
+        internal bool WaitForOutputDrain(int timeoutMilliseconds)
+        {
+            long deadline = Environment.TickCount64 + timeoutMilliseconds;
+            lock (_outputDrainLock)
+            {
+                while (_pendingOutput > 0)
+                {
+                    int remaining = (int)(deadline - Environment.TickCount64);
+                    if (remaining <= 0)
+                    {
+                        return false;
+                    }
+                    Monitor.Wait(_outputDrainLock, remaining);
+                }
+                return true;
             }
         }
 
@@ -283,6 +422,17 @@ namespace Microsoft.PowerShell
                     foreach (string line in _queue.GetConsumingEnumerable())
                     {
                         writer.WriteLine(line);
+                        if (line.Contains("\"event\":\"O\""))
+                        {
+                            lock (_outputDrainLock)
+                            {
+                                if (_pendingOutput > 0)
+                                {
+                                    _pendingOutput--;
+                                }
+                                Monitor.PulseAll(_outputDrainLock);
+                            }
+                        }
                     }
                 }
             }
@@ -294,6 +444,14 @@ namespace Microsoft.PowerShell
             finally
             {
                 _enabled = false;
+                // A dead event pipe must not make every later command wait the
+                // full drain timeout: drop the pending O count and wake any
+                // waiter so D is queued immediately.
+                lock (_outputDrainLock)
+                {
+                    _pendingOutput = 0;
+                    Monitor.PulseAll(_outputDrainLock);
+                }
             }
         }
 

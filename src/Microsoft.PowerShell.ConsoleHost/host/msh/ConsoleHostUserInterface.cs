@@ -617,6 +617,10 @@ namespace Microsoft.PowerShell
             ConsoleOutWriteHelper(value, newLine);
 #endif
 
+            // Out-of-band command output. Prompt/input echo has no active
+            // command id and is ignored by the channel.
+            ConsoleHost.WriteShellOutput(value.ToString(), newLine);
+
             if (_isInteractiveTestToolListening && Console.IsOutputRedirected)
             {
                 ConsoleOutWriteHelper(value, newLine);
@@ -1397,6 +1401,7 @@ namespace Microsoft.PowerShell
                 else
                 {
                     value = GetOutputString(value, SupportsVirtualTerminal);
+                    ConsoleHost.WriteShellOutput(value, newLine: true);
                     Console.Error.WriteLine(value);
                 }
             }
