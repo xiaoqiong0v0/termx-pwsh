@@ -109,10 +109,9 @@ namespace Microsoft.PowerShell
                 }
 
                 // Ensure every O frame produced by this command is on the
-                // event pipe before D; this is event-queue drain, not a
-                // timing-based boundary.
-                s_shellEvents.WaitForOutputDrain(2000);
-
+                // event pipe before D. The write path owns the drain while
+                // holding the command lock, so another thread cannot enqueue
+                // O after D. This is event-queue drain, not a timing boundary.
                 WriteShellEvent(
                     "D",
                     GetCommandExitCode(e),
@@ -206,6 +205,7 @@ namespace Microsoft.PowerShell
         private const int MaxQueuedEvents = 1024;
         private const int MaxOutputChunkChars = 512;
         private const int ConnectTimeoutMilliseconds = 3000;
+        private const int OutputDrainTimeoutMilliseconds = 2000;
 
         private readonly BlockingCollection<string> _queue =
             new BlockingCollection<string>(new ConcurrentQueue<string>(), MaxQueuedEvents);
@@ -215,6 +215,7 @@ namespace Microsoft.PowerShell
         private readonly object _commandLock = new object();
         private readonly object _outputDrainLock = new object();
         private int _pendingOutput;
+        private bool _outputDropped;
         private volatile bool _enabled;
         private string _currentCommandId;
 
@@ -273,6 +274,7 @@ namespace Microsoft.PowerShell
                     lock (_commandLock)
                     {
                         _currentCommandId = commandId;
+                        _outputDropped = false;
                         TryEnqueue(BuildLine(kind, code, commandId, command, startedAtMs, null));
                     }
                     return;
@@ -283,7 +285,18 @@ namespace Microsoft.PowerShell
                     {
                         string commandId = _currentCommandId;
                         _currentCommandId = null;
-                        TryEnqueue(BuildLine(kind, code, commandId, null, null, endedAtMs));
+
+                        // Own the O drain here, while still holding the
+                        // command lock: no other thread can enqueue O between
+                        // the drain and D, so O can never follow D. The
+                        // writer thread only needs _outputDrainLock, so this
+                        // wait cannot deadlock. The timeout is a failure
+                        // guard; D is still enqueued after it expires.
+                        WaitForOutputDrain(OutputDrainTimeoutMilliseconds);
+
+                        bool dropped = _outputDropped;
+                        _outputDropped = false;
+                        TryEnqueue(BuildLine(kind, code, commandId, null, null, endedAtMs, dropped));
                     }
                     return;
                 }
@@ -372,11 +385,14 @@ namespace Microsoft.PowerShell
                     {
                         // Queue full/closed: drop this and the remaining
                         // chunks, roll the drain counter back and let D pass.
+                        // Remember the loss so the D event can flag
+                        // incomplete transcript output.
                         lock (_outputDrainLock)
                         {
                             _pendingOutput--;
                             Monitor.PulseAll(_outputDrainLock);
                         }
+                        _outputDropped = true;
                         return;
                     }
                     offset += length;
@@ -466,7 +482,8 @@ namespace Microsoft.PowerShell
             string commandId,
             string command,
             long? startedAtMs,
-            long? endedAtMs)
+            long? endedAtMs,
+            bool dropped = false)
         {
             StringBuilder builder = new StringBuilder(128);
             builder.Append("{\"v\":1,\"event\":\"").Append(kind).Append('"');
@@ -500,6 +517,11 @@ namespace Microsoft.PowerShell
                 builder
                     .Append(",\"ended_at_ms\":")
                     .Append(endedAtMs.Value.ToString(CultureInfo.InvariantCulture));
+            }
+
+            if (dropped)
+            {
+                builder.Append(",\"dropped\":true");
             }
 
             builder.Append('}');
